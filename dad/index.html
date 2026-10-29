@@ -20,22 +20,935 @@
   .note { background:var(--accent-soft); border-radius:14px; padding:14px 16px; margin-top:14px; color:var(--body); font-size:18px; }
   .done { text-align:center; font-size:22px; font-weight:700; padding:28px 22px; }
   .small { font-size:17px; color:var(--body); }
+  .keep { white-space:nowrap; }
+  .tap.own { display:table; margin-top:6px; white-space:normal; }
 </style>
-</head>
+<script>window.KO_LINEBREAK_PHRASES = ["구글 로그인", "글쓰기 연결", "꼭 사파리(또는", "누르실 때만", "두 가지만", "드리는 안내", "딱 두", "로그인 화면이", "리치가 드리는", "만들고 바로", "보일 수", "스레드 앱에는", "스레드 열기", "스레드 자동", "쓰시는 @sangun.dbclass).", "아버지 계정에만", "아버지 스레드", "안 돼요.", "안 보일", "안내 화면이", "앱 위에", "앱 위쪽", "연결 방법", "올리실 수", "웹사이트 권한", "위쪽 버튼을", "카카오톡 안에서", "폰 인터넷", "한 번"];</script><script>
+/*! ko-linebreak dropin 1.1.2 | ~/projects/richard/shared/ko-linebreak | one line: <script src="ko-linebreak-dropin-1.1.2.js" defer><\/script> */
+/*
+ * ko-linebreak.js - Korean line breaking for card news / ad HTML rendered in Chromium.
+ * No dependencies. Load as a plain <script> (sets globalThis.KoLinebreak) or require() it.
+ *
+ *   KoLinebreak.apply(el)            // keep-all CSS + glue + balanced <br> breaks, no orphans
+ *   KoLinebreak.applyAll('.title, .body')
+ *   KoLinebreak.glue(text)           // only the no-break-space rules (string in, string out)
+ *   KoLinebreak.measure(el)          // per-line text + widths read from Range rects
+ *   KoLinebreak.problems(el, opts)   // measured problems list (used by check-linebreak.mjs)
+ *
+ * Call after `await document.fonts.ready`. The box width is the element's content width.
+ */
+(function (root) {
+  'use strict';
+  var NBSP = '\u00A0';
+  var HANGUL = /[\uAC00-\uD7A3]/;
+  // Units that must stay on the same line as the number before them.
+  var UNIT = /^(%|퍼센트|분|초|시간|시|일|주|개월|월|년|원|만원|억|만|천|명|개|건|배|위|번|회|살|세|kg|g|km|m|cm|mm|ml|L|p|P|x|X|배속|점|등|차|층|장|권|병|잔|곳|가지)/;
+  // One-syllable words that lean on the next word (determiners, short adverbs).
+  var LEAN_NEXT = /^(한|두|세|네|새|헌|각|더|덜|잘|꼭|안|못|다|또|왜|이|그|저|좀|딱|늘|곧|참|확)$/;
+  // Bound nouns that cannot start a line (수, 것, 때 ... with an optional particle).
+  var BOUND = /^(수|것|줄|데|때|뿐|등|듯|적|바|채|만큼|대로)(가|도|는|은|을|를|이|에|의|만|과|와|로)?[.,!?]?$/;
+
+  function syllables(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) if (HANGUL.test(s[i]) || /[A-Za-z0-9]/.test(s[i])) n++;
+    return n;
+  }
+
+  /** Replace spaces that must not break with U+00A0. */
+  function glue(text) {
+    var words = text.split(/ +/);
+    if (words.length < 2) return text;
+    var out = words[0];
+    for (var i = 1; i < words.length; i++) {
+      var prev = words[i - 1], cur = words[i];
+      var g = false;
+      if (/[0-9]$/.test(prev) && UNIT.test(cur)) g = true;           // 1 분, 30 %
+      if (LEAN_NEXT.test(prev.replace(/[.,!?]$/, '')) && !/[,.!?]$/.test(prev)) g = true; // 더 정확하게, 한 문장
+      if (BOUND.test(cur)) g = true;                                  // 대신할 수
+      if (i === words.length - 1 && syllables(cur) <= 2) g = true;    // last short word never alone
+      out += (g ? NBSP : ' ') + cur;
+    }
+    return out;
+  }
+
+  function textWidthFn(el) {
+    var cs = getComputedStyle(el);
+    var c = document.createElement('canvas').getContext('2d');
+    c.font = cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
+    if (cs.letterSpacing && cs.letterSpacing !== 'normal') c.letterSpacing = cs.letterSpacing;
+    return function (s) { return c.measureText(s).width; };
+  }
+
+  /**
+   * Choose break points among tokens (split at normal spaces only).
+   * Same line count as plain wrapping; lines as even as possible; last line > 2 syllables.
+   * Returns array of line strings.
+   */
+  function breakTokens(tokens, maxWidth, widthOf, opts) {
+    opts = opts || {};
+    var minLast = opts.minLastSyllables == null ? 3 : opts.minLastSyllables;
+    var n = tokens.length;
+    var W = maxWidth - 1; // 1px safety for subpixel differences
+    var lw = [];
+    for (var i = 0; i < n; i++) {
+      lw[i] = [];
+      for (var j = i; j < n; j++) lw[i][j] = widthOf(tokens.slice(i, j + 1).join(' '));
+    }
+    // Greedy line count = what the browser would use.
+    var greedy = 0, k = 0;
+    while (k < n) { var e = k; while (e + 1 < n && lw[k][e + 1] <= W) e++; greedy++; k = e + 1; }
+    // DP: best[j][L] = min cost to place tokens[0..j-1] in L lines.
+    var INF = 1e18, maxL = Math.min(n, greedy + 1);
+    var best = [], prev = [];
+    for (var a = 0; a <= n; a++) { best[a] = []; prev[a] = []; for (var L = 0; L <= maxL; L++) best[a][L] = INF; }
+    best[0][0] = 0;
+    for (var L2 = 1; L2 <= maxL; L2++) {
+      for (var j2 = 1; j2 <= n; j2++) {
+        for (var i2 = 0; i2 < j2; i2++) {
+          if (best[i2][L2 - 1] >= INF) continue;
+          var w = lw[i2][j2 - 1];
+          var over = w > W ? (j2 - i2 === 1 ? 1e9 : INF) : 0; // a single too-long token is allowed but costly
+          if (over >= INF) continue;
+          var slack = Math.max(0, W - w);
+          var cost = slack * slack + over;
+          var lineText = tokens.slice(i2, j2).join(' ');
+          if (syllables(lineText) < minLast) cost += 1e7;           // short line anywhere is bad
+          if (j2 === n && syllables(lineText) < minLast) cost += 1e8; // worst on the last line
+          if (j2 < n && /,$/.test(tokens[j2 - 1])) cost -= W * W * 0.08; // a comma is the natural place to break
+          var tot = best[i2][L2 - 1] + cost;
+          if (tot < best[j2][L2]) { best[j2][L2] = tot; prev[j2][L2] = i2; }
+        }
+      }
+    }
+    // Prefer the greedy line count; use one extra line only if it removes a penalty.
+    var pick = greedy;
+    if (maxL > greedy && best[n][greedy] >= 1e7 && best[n][greedy + 1] < 1e7) pick = greedy + 1;
+    if (best[n][pick] >= INF) return [tokens.join(' ')];
+    var lines = [], end = n, LL = pick;
+    while (LL > 0) { var st = prev[end][LL]; lines.unshift(tokens.slice(st, end).join(' ')); end = st; LL--; }
+    return lines;
+  }
+
+  /** Full treatment for one element. opts.glued = pre-glued text (e.g. from Kiwi). */
+  function apply(el, opts) {
+    opts = opts || {};
+    if (el.dataset.koSource == null) el.dataset.koSource = el.textContent.replace(/\s+/g, ' ').trim();
+    var src = el.dataset.koSource;
+    el.style.wordBreak = 'keep-all';
+    el.style.overflowWrap = 'anywhere';
+    el.style.textWrap = 'wrap';
+    var text = opts.glued || glue(src);
+    var tokens = text.split(' ');
+    var width = el.clientWidth - parseFloat(getComputedStyle(el).paddingLeft) - parseFloat(getComputedStyle(el).paddingRight);
+    var lines = breakTokens(tokens, width, textWidthFn(el), opts);
+    el.textContent = '';
+    lines.forEach(function (ln, idx) {
+      if (idx) { el.appendChild(document.createTextNode(' ')); el.appendChild(document.createElement('br')); }
+      el.appendChild(document.createTextNode(ln));
+    });
+    return lines;
+  }
+
+  function applyAll(selector, opts) {
+    return Array.prototype.map.call(document.querySelectorAll(selector), function (el) { return apply(el, opts); });
+  }
+
+  /** Lines as the browser painted them: one Range per character, grouped by line box. */
+  function measure(el) {
+    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    var chars = [], node, r = document.createRange();
+    while ((node = walker.nextNode())) {
+      for (var i = 0; i < node.data.length; i++) {
+        var ch = node.data[i];
+        if (/\s/.test(ch) && ch !== NBSP) { chars.push({ ch: ' ' }); continue; }
+        r.setStart(node, i); r.setEnd(node, i + 1);
+        var rects = r.getClientRects();
+        if (!rects.length) { chars.push({ ch: ch }); continue; }
+        var b = rects[rects.length - 1];
+        chars.push({ ch: ch, top: b.top, bottom: b.bottom, left: b.left, right: b.right });
+      }
+    }
+    var lines = [], cur = null;
+    chars.forEach(function (c, idx) {
+      if (c.top == null) { if (cur) cur.text += c.ch === NBSP ? ' ' : c.ch; return; }
+      var mid = (c.top + c.bottom) / 2;
+      if (!cur || mid > cur.bottom) {
+        cur = { text: '', top: c.top, bottom: c.bottom, left: c.left, right: c.right, startIndex: idx };
+        lines.push(cur);
+      }
+      cur.text += c.ch === NBSP ? ' ' : c.ch;
+      if (c.ch !== NBSP) { cur.left = Math.min(cur.left, c.left); cur.right = Math.max(cur.right, c.right); }
+    });
+    var box = el.getBoundingClientRect();
+    var cs = getComputedStyle(el);
+    var inner = box.width - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    return {
+      boxWidth: inner,
+      lines: lines.map(function (l) { return { text: l.text.trim(), width: l.right - l.left }; }),
+      chars: chars.map(function (c) { return c.ch; }).join('')
+    };
+  }
+
+  /** Measured problems for one element. */
+  function problems(el, opts) {
+    opts = opts || {};
+    var maxSpread = opts.maxSpread == null ? 2.5 : opts.maxSpread;
+    var m = measure(el);
+    var src = (el.dataset.koSource || el.textContent).replace(/\s+/g, ' ').trim();
+    var out = [];
+    var L = m.lines;
+    for (var i = 1; i < L.length; i++) {
+      var a = L[i - 1].text, b = L[i].text;
+      var lastA = a.replace(/\s+$/, '').slice(-1), firstB = b.charAt(0);
+      // Was there a space in the source at this break? Compare by position in the joined line text.
+      var joinedBefore = L.slice(0, i).map(function (x) { return x.text.replace(/\s/g, ''); }).join('');
+      var srcNoSpaceIdx = 0, srcPos = -1;
+      for (var p = 0; p < src.length; p++) {
+        if (/\s/.test(src[p])) continue;
+        if (srcNoSpaceIdx === joinedBefore.length) { srcPos = p; break; }
+        srcNoSpaceIdx++;
+      }
+      var spaceInSource = srcPos > 0 && /\s/.test(src[srcPos - 1]);
+      if (!spaceInSource && /[\uAC00-\uD7A3A-Za-z]/.test(lastA) && /[\uAC00-\uD7A3A-Za-z]/.test(firstB))
+        out.push({ type: 'mid-word', at: a + ' | ' + b });
+      if (/[0-9]/.test(lastA) && UNIT.test(b)) out.push({ type: 'number-unit', at: a + ' | ' + b });
+    }
+    if (L.length > 1) {
+      var last = L[L.length - 1].text;
+      if (syllables(last) <= 2) out.push({ type: 'orphan', at: last });
+      var ws = L.map(function (l) { return l.width; });
+      var spread = Math.max.apply(null, ws) / Math.max(1, Math.min.apply(null, ws));
+      if (spread > maxSpread) out.push({ type: 'ragged', at: spread.toFixed(2) });
+    }
+    L.forEach(function (l) { if (l.width > m.boxWidth + 1) out.push({ type: 'overflow', at: l.text }); });
+    return { lines: L, boxWidth: m.boxWidth, problems: out };
+  }
+
+  var api = { glue: glue, breakTokens: breakTokens, apply: apply, applyAll: applyAll, measure: measure, problems: problems, syllables: syllables, NBSP: NBSP };
+  root.KoLinebreak = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+
+/*
+ * ko-linebreak auto layer (built into dropin.js by build.mjs; not loaded on its own).
+ *
+ * What it does on a page:
+ *   - finds every visible box with Korean text (the nearest non-inline ancestor of a Hangul text node);
+ *   - measures the painted lines; a box whose lines already pass is left completely alone;
+ *   - a box with problems (break inside a word or where the text has no space, 1-2 syllable last line, ragged lines,
+ *     number|unit split, 1.1.0: a break inside a meaning unit) gets balanced break points chosen by ko-linebreak's
+ *     rules: every space that must not break becomes U+00A0 and every join inside a word gets U+2060 (word joiner),
+ *     inside the existing text nodes, with word-break: normal on the box (1.1.0; WebKit ignores U+2060 under keep-all). No element is added, removed or moved,
+ *     so React/Vue-managed markup stays intact;
+ *   - the change is kept only if the measured problems go down and the box keeps its width; otherwise it is undone;
+ *   - re-runs (debounced) on resize, font load and DOM changes (MutationObserver).
+ * Never touched: input, textarea, select, code, pre, kbd, samp, svg, contenteditable, buttons ([role=button]),
+ * anything inside [data-no-ko-linebreak], text inside nowrap/pre contexts and inline-block pills.
+ * Set globalThis.KO_LINEBREAK_GLUE = { "<source text>": "<same text with U+00A0 at glued spaces>" } (Kiwi output)
+ * to add phrase glue. Set globalThis.KO_LINEBREAK_NO_AUTO = true before loading to get the API without auto-run.
+ */
+(function (root) {
+  'use strict';
+  var KL = root.KoLinebreak;
+  if (!KL || typeof document === 'undefined' || root.KoLinebreakAuto) return;
+  var VERSION = "1.1.2";
+  var NBSP = '\u00A0';
+  var HANGUL = /[\uAC00-\uD7A3]/;
+  var LETTER = /[\uAC00-\uD7A3A-Za-z]/;
+  var SPACE = /[ \t\n\r\f]/;
+  var WJ = '\u2060';
+  var FIX_WORD_BREAK = 'normal'; // see edit(): joiners, not keep-all, hold words together in fixed boxes
+  var WORDCH = /[\uAC00-\uD7A3\u3131-\u318EA-Za-z0-9]/;
+  var UNIT = /^(%|퍼센트|분|초|시간|시|일|주|개월|월|년|원|만원|억|만|천|명|개|건|배|위|번|회|살|세|kg|g|km|m|cm|mm|ml|L|p|P|x|X|배속|점|등|차|층|장|권|병|잔|곳|가지)/;
+  var SKIP = 'input,textarea,select,option,code,pre,kbd,samp,script,style,noscript,template,svg,math,iframe,'
+    + '[contenteditable=""],[contenteditable="true"],[contenteditable="plaintext-only"],[data-no-ko-linebreak]';
+  var BUTTON = 'button,[role="button"]';
+  var FIXABLE = /^(block|list-item|flow-root|table-cell|table-caption|inline-block)$/;
+  var ATOMIC = /^(IMG|INPUT|SELECT|TEXTAREA|BUTTON|VIDEO|CANVAS|IFRAME|svg|SVG|OBJECT|EMBED|METER|PROGRESS)$/;
+  var OPEN_GLUE = /[(\[{「『+]$/;
+  var CLOSE_GLUE = /^[·)\]}」』.,!?:;%~]/;
+  // Meaning units (1.1.0). Number ranges that read as one unit: 7박 8일, 3시 30분, 2026년 10월.
+  var RANGE = { '박': '일', '시': '분', '시간': '분', '년': '월', '월': '일', '분': '초', '억': '만', '만': '천' };
+  var SEPARATOR = /^[·\-–—|\/+]$/;
+  var PARTICLE_REST = /^(은|는|이|가|을|를|의|에|에서|에게|와|과|나|이나|도|만|로|으로|부터|까지|께|요|이다|입니다|이에요|예요)?[.,!?)\]」』:]*$/;
+  // Generic phrases glued everywhere; a page adds its own with window.KO_LINEBREAK_PHRASES = ['골프 레슨', ...].
+  var DEFAULT_PHRASES = ['개인정보 수집', '개인정보 문의', '개인정보 처리', '개인정보 보호', '동의 철회', '제3자 제공', '휴대폰 번호',
+    '전화 번호', '보관 기간', '수집 항목'];
+
+  // ---------- grapheme clusters (1.1.0 fix: never split a surrogate pair, ZWJ sequence, flag or modifier sequence) ----------
+  var segmenter = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+  var EXTEND = /^(?:\p{M}|\u200D|[\uFE0E\uFE0F]|[\u{1F3FB}-\u{1F3FF}]|[\u{E0020}-\u{E007F}])/u;
+  var RI = /^[\u{1F1E6}-\u{1F1FF}]$/u;
+  function clusters(s) {
+    var out = [];
+    if (segmenter) {
+      for (var seg of segmenter.segment(s)) out.push({ s: seg.segment, i: seg.index });
+      return out;
+    }
+    var i = 0;
+    while (i < s.length) {
+      var cp = String.fromCodePoint(s.codePointAt(i)), j = i + cp.length;
+      if (RI.test(cp) && j < s.length && RI.test(String.fromCodePoint(s.codePointAt(j)))) j += 2;
+      for (;;) {
+        var m = EXTEND.exec(s.slice(j));
+        if (!m) break;
+        j += m[0].length;
+        if (m[0] === '\u200D' && j < s.length) j += String.fromCodePoint(s.codePointAt(j)).length;
+      }
+      out.push({ s: s.slice(i, j), i: i });
+      i = j;
+    }
+    return out;
+  }
+
+  var records = new Map();      // box -> { edits: [{ node, orig, wrote }], wordBreak, width }
+  var clean = new WeakMap();    // box -> key (source|width) measured clean, skip until it changes
+  var churn = new WeakMap();    // box -> [timestamps] of reprocessing, loop guard
+  var banned = new WeakSet();   // boxes that kept changing under us: left alone
+  var csCache = null;
+  function cs(el) {
+    if (!csCache) return getComputedStyle(el);
+    var s = csCache.get(el);
+    if (!s) { s = getComputedStyle(el); csCache.set(el, s); }
+    return s;
+  }
+
+  // ---------- which box a text node belongs to ----------
+  function boxOf(t) {
+    var el = t.parentElement;
+    if (!el || el.closest(SKIP)) return null;
+    var btn = el.closest(BUTTON);
+    if (btn) return btn;
+    while (el && el !== document.documentElement) {
+      var d = cs(el).display;
+      if (d !== 'inline' && d !== 'contents') return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+  function kindOf(el) {
+    if (el.matches(BUTTON)) return 'button';
+    var st = cs(el);
+    if (st.display === 'none') return null;
+    var ws = st.whiteSpace;
+    if (ws === 'nowrap' || ws === 'pre') return 'nowrap';
+    var fixable = FIXABLE.test(st.display) && (ws === 'normal' || ws === 'pre-line' || ws === 'pre-wrap');
+    if (!fixable) return 'other';
+    return hasBlockChild(el) ? 'mixed' : 'box';
+  }
+  // Block children next to text: measured, never changed.
+  function hasBlockChild(el) {
+    for (var n = el.firstElementChild; n; n = n.nextElementSibling) {
+      var d = cs(n).display;
+      if (d === 'none' || n.tagName === 'BR' || n.tagName === 'WBR') continue;
+      if (/^inline-/.test(d) || ATOMIC.test(n.tagName) || n.matches(SKIP) || n.matches(BUTTON)) continue;
+      if (d === 'inline' || d === 'contents') { if (hasBlockChild(n)) return true; continue; }
+      return true;
+    }
+    return false;
+  }
+
+  // ---------- model: the box's own text, in order ----------
+  // items: { t: 'c', ch, node, i, sp, wrap, preserve, fontEl } | { t: 'a', el } (atomic: pill, icon, img) | { t: 'f' } (forced break)
+  function model(box) {
+    var items = [];
+    function walk(el) {
+      for (var n = el.firstChild; n; n = n.nextSibling) {
+        if (n.nodeType === 3) {
+          var p = n.parentElement, ws = cs(p).whiteSpace;
+          var wrap = !(ws === 'nowrap' || ws === 'pre');
+          var preserve = ws === 'pre' || ws === 'pre-wrap' || ws === 'break-spaces';
+          var keepNL = preserve || ws === 'pre-line';
+          var cl = clusters(n.data);
+          for (var c = 0; c < cl.length; c++) {
+            var ch = cl[c].s;
+            if (ch === WJ) continue;
+            if (ch === '\r\n') ch = '\n';
+            if (ch === '\n' && keepNL) { items.push({ t: 'f', nl: true }); continue; } // author's newline, not ours
+            items.push({ t: 'c', ch: ch, node: n, i: cl[c].i, len: cl[c].s.length, sp: SPACE.test(ch) && ch.length === 1, wrap: wrap, preserve: preserve, fontEl: p });
+          }
+        } else if (n.nodeType === 1) {
+          if (n.tagName === 'BR') { items.push({ t: 'f' }); continue; }
+          var st = cs(n), d = st.display;
+          if (d === 'none') continue;
+          if (n.matches(SKIP) || n.matches(BUTTON) || ATOMIC.test(n.tagName) || /^inline-/.test(d)) { items.push({ t: 'a', el: n }); continue; }
+          if (d === 'inline' || d === 'contents') { walk(n); continue; }
+          items.push({ t: 'f', block: true });
+        }
+      }
+    }
+    walk(box);
+    return items;
+  }
+
+  // Segments (split at forced breaks) of words and gaps. A gap = a run of spaces between two words.
+  function structure(items) {
+    var segs = [], seg = null, word = null, gap = null;
+    function newSeg() { seg = { words: [], gaps: [] }; segs.push(seg); word = null; gap = null; }
+    newSeg();
+    for (var k = 0; k < items.length; k++) {
+      var it = items[k];
+      if (it.t === 'f') { newSeg(); continue; }
+      if (it.t === 'c' && it.sp) {
+        if (!seg.words.length) continue;               // leading space
+        if (!gap) { gap = { chars: [], wrap: true }; }
+        gap.chars.push(it);
+        if (!it.wrap) gap.wrap = false;
+        word = null;
+        continue;
+      }
+      if (!word) {
+        if (gap) seg.gaps.push(gap);
+        gap = null;
+        word = { items: [], text: '' };
+        seg.words.push(word);
+      }
+      word.items.push(it);
+      word.text += it.t === 'a' ? '\uFFFC' : (it.ch === NBSP ? NBSP : it.ch);
+    }
+    return segs.filter(function (s) { return s.words.length; });
+  }
+  function sourceOf(segs) {
+    return segs.map(function (s) { return s.words.map(function (w) { return w.text.replace(/\u00A0/g, ' '); }).join(' '); }).join(' ');
+  }
+
+  // ---------- measuring painted lines ----------
+  function units(items) {
+    // Visible units in order with their rects; spaces/NBSP are kept as gap markers.
+    // wi = index of the unit's word in the box source (sourceOf split at spaces), for the meaning-unit check.
+    var out = [], r = document.createRange(), pendingGap = false, pendingForced = false, wi = 0, started = false;
+    for (var k = 0; k < items.length; k++) {
+      var it = items[k];
+      if (it.t === 'f') { pendingForced = it.block ? 'block' : it.nl ? 'nl' : 'br'; continue; }
+      if (it.t === 'c' && (it.sp || it.ch === NBSP)) { pendingGap = true; continue; }
+      if (it.t === 'c' && it.ch === WJ) continue;
+      var rect;
+      if (it.t === 'a') {
+        var rs = it.el.getClientRects();
+        if (!rs.length) continue;
+        rect = it.el.getBoundingClientRect();
+      } else {
+        if (it.i + it.len > it.node.data.length) continue;
+        r.setStart(it.node, it.i); r.setEnd(it.node, it.i + it.len);
+        var rects = r.getClientRects();
+        if (!rects.length) continue;
+        rect = rects[rects.length - 1];
+        if (!rect.width && !rect.height) continue;
+      }
+      if (started && (pendingGap || pendingForced)) wi++;
+      started = true;
+      out.push({ ch: it.t === 'a' ? '\uFFFC' : it.ch, rect: rect, gapBefore: pendingGap, forcedBefore: pendingForced, wi: wi });
+      pendingGap = false; pendingForced = false;
+    }
+    return out;
+  }
+  function linesOf(us) {
+    var segs = [], lines = null, cur = null;
+    for (var k = 0; k < us.length; k++) {
+      var u = us[k], mid = (u.rect.top + u.rect.bottom) / 2;
+      if (!lines || u.forcedBefore) { lines = []; segs.push(lines); cur = null; }
+      if (!cur || mid > cur.bottom) {
+        cur = { text: '', top: u.rect.top, bottom: u.rect.bottom, left: u.rect.left, right: u.rect.right, first: u, prevLast: cur ? cur.last : null };
+        lines.push(cur);
+      } else if (u.gapBefore) cur.text += ' ';
+      cur.text += u.ch;
+      cur.left = Math.min(cur.left, u.rect.left); cur.right = Math.max(cur.right, u.rect.right);
+      cur.bottom = Math.max(cur.bottom, u.rect.bottom);
+      cur.last = u;
+    }
+    return segs;
+  }
+  function contentWidth(box) {
+    var st = cs(box);
+    return box.clientWidth - parseFloat(st.paddingLeft) - parseFloat(st.paddingRight);
+  }
+
+  // ---------- meaning units (1.1.0) ----------
+  var phraseKey = null, phraseWords = [];
+  function phraseList() {
+    var extra = Array.isArray(root.KO_LINEBREAK_PHRASES) ? root.KO_LINEBREAK_PHRASES : [];
+    var key = extra.join('\n');
+    if (key !== phraseKey) {
+      phraseKey = key;
+      phraseWords = DEFAULT_PHRASES.concat(extra).map(function (p) { return String(p).trim().split(/\s+/); })
+        .filter(function (w) { return w.length > 1; });
+    }
+    return phraseWords;
+  }
+  /** glued[g] = true -> the space after word g of src is inside a meaning unit (src = words joined by single spaces). */
+  function meaningGlue(src) {
+    var words = src.split(' '), n = words.length, out = [], g, pos;
+    if (n < 2) return out;
+    // KL.glue's "short last word" rule is about orphans, not meaning: a dummy last word switches it off.
+    var js = KL.glue(src + ' 가나다');
+    pos = words[0].length;
+    for (g = 0; g < n - 1; g++) { out.push(js[pos] === NBSP); pos += 1 + words[g + 1].length; }
+    for (g = 0; g < n - 1; g++) {
+      var a = words[g], b = words[g + 1], m = /[0-9]([\uAC00-\uD7A3]{1,2})$/.exec(a);
+      if (m && RANGE[m[1]] && new RegExp('^[0-9][0-9,.]*' + RANGE[m[1]] + '(?![0-9])').test(b)) out[g] = true;
+      if (/[0-9][만천억]$/.test(a) && UNIT.test(b)) out[g] = true;
+      if (g > 0 && SEPARATOR.test(words[g - 1]) && KL.syllables(a) <= 3 && !/[,.!?]$/.test(a) && /[\uAC00-\uD7A3]/.test(b)) out[g] = true;
+    }
+    phraseList().forEach(function (p) {
+      var k = p.length;
+      for (var i = 0; i + k <= n; i++) {
+        // 1.1.1: phrase words may contain '·' ('인원·음식 예산·상점'); a word matches its phrase word whole or as a tail
+        // after '·', '(', '[', '/' ('(숙박·식사·수업·골프' matches '골프').
+        var w0 = words[i], cut = w0.length - p[0].length;
+        if (!(w0 === p[0] || (cut > 0 && w0.slice(cut) === p[0] && /[·(\[\/]$/.test(w0.slice(0, cut))))) continue;
+        var ok = true;
+        for (var j = 1; j < k - 1; j++) if (words[i + j] !== p[j]) ok = false;
+        var last = words[i + k - 1];
+        var rest = last.slice(p[k - 1].length);
+        if (!ok || last.indexOf(p[k - 1]) !== 0 || !(PARTICLE_REST.test(rest) || /^[·\/]/.test(rest))) continue;
+        // 1.1.2: a punctuation-only word ('/', '·', '-') is never glued to its neighbour by a phrase (studio '/ 바로').
+        for (j = i; j < i + k - 1; j++) if (/[\uAC00-\uD7A3A-Za-z0-9]/.test(words[j]) && /[\uAC00-\uD7A3A-Za-z0-9]/.test(words[j + 1])) out[j] = true;
+      }
+    });
+    // 1.1.2: no rule glues a punctuation-only word ('/', '-', '·') to its neighbour: KL's bound-noun rule read
+    // '/ 바로' as '~한 바로' (studio /status).
+    for (g = 0; g < n - 1; g++) if (!/[\uAC00-\uD7A3A-Za-z0-9]/.test(words[g]) || !/[\uAC00-\uD7A3A-Za-z0-9]/.test(words[g + 1])) out[g] = false;
+    var map = root.KO_LINEBREAK_GLUE, kiwi = map && map[src];
+    if (kiwi && kiwi.length === src.length) {
+      pos = words[0].length;
+      for (g = 0; g < n - 1; g++) { if (kiwi[pos] === NBSP) out[g] = true; pos += 1 + words[g + 1].length; }
+    }
+    return out;
+  }
+
+  /** Problems of one box as painted now. kind 'button'/'nowrap' only get the break-inside-word checks. */
+  function problemsOf(box, kind, items) {
+    items = items || model(box);
+    var segs = linesOf(units(items));
+    var bw = contentWidth(box);
+    var src = sourceOf(structure(items)), words = src.split(' '), gl = meaningGlue(src);
+    var out = [], all = [], prevLine = null;
+    function meaning(u, a, b) {
+      if (u.wi > 0 && gl[u.wi - 1]) out.push({ type: 'meaning-unit', at: words[u.wi - 1] + ' | ' + words[u.wi] + '  (' + a.text + ' | ' + b.text + ')' });
+    }
+    segs.forEach(function (lines) {
+      if (prevLine && lines.length && lines[0].first.forcedBefore === 'br') meaning(lines[0].first, prevLine, lines[0]);
+      if (lines.length) prevLine = lines[lines.length - 1];
+      for (var i = 0; i < lines.length; i++) {
+        all.push(lines[i]);
+        if (!i) continue;
+        if (lines[i].first.gapBefore) meaning(lines[i].first, lines[i - 1], lines[i]);
+        var a = lines[i - 1], b = lines[i], u = b.first, prevCh = a.last.ch;
+        if (!u.gapBefore) {
+          var type = LETTER.test(prevCh) && LETTER.test(u.ch) ? 'mid-word' : 'no-space-break';
+          out.push({ type: type, at: a.text + ' | ' + b.text });
+        }
+        if (kind === 'button' || kind === 'nowrap') continue;
+        if (/[0-9]/.test(prevCh) && UNIT.test(b.text)) out.push({ type: 'number-unit', at: a.text + ' | ' + b.text });
+      }
+      if (kind === 'button' || kind === 'nowrap' || lines.length < 2) return;
+      var last = lines[lines.length - 1].text;
+      if (KL.syllables(last) <= 2) out.push({ type: 'orphan', at: last });
+      var ws = lines.map(function (l) { return l.right - l.left; });
+      var spread = Math.max.apply(null, ws) / Math.max(1, Math.min.apply(null, ws));
+      if (spread > 2.5) out.push({ type: 'ragged', at: spread.toFixed(2) + ' (' + lines.map(function (l) { return l.text; }).join(' / ') + ')' });
+    });
+    if (kind !== 'button' && kind !== 'nowrap' && bw > 0) {
+      var bl = box.getBoundingClientRect().left + box.clientLeft + parseFloat(cs(box).paddingLeft);
+      all.forEach(function (l) { if (l.right - bl > bw + 1.5 && l.right - l.left > bw + 1) out.push({ type: 'overflow', at: l.text }); });
+    }
+    return { lines: segs.map(function (ls) { return ls.map(function (l) { return l.text; }); }), problems: out };
+  }
+
+  // 1.1.2: text inside a closed <details> (not its <summary>) is not shown: never measured or fixed until it opens.
+  function inClosedDetails(el) {
+    var d = el.closest('details:not([open])');
+    return !!d && !el.closest('details:not([open]) > summary');
+  }
+
+  // ---------- choosing breaks ----------
+  var canvas = null, fonts = new WeakMap();
+  function widthFn(el) {
+    var f = fonts.get(el);
+    if (f) return f;
+    if (!canvas) canvas = document.createElement('canvas').getContext('2d');
+    var st = cs(el);
+    var font = st.fontStyle + ' ' + st.fontWeight + ' ' + st.fontSize + ' ' + st.fontFamily;
+    var ls = parseFloat(st.letterSpacing) || 0, cache = {};
+    f = function (ch) {
+      if (cache[ch] == null) { canvas.font = font; cache[ch] = canvas.measureText(ch).width + ls; }
+      return cache[ch];
+    };
+    fonts.set(el, f);
+    return f;
+  }
+  function itemWidth(it) {
+    if (it.t === 'a') {
+      var st = cs(it.el);
+      return it.el.getBoundingClientRect().width + (parseFloat(st.marginLeft) || 0) + (parseFloat(st.marginRight) || 0);
+    }
+    return widthFn(it.fontEl)(it.ch === NBSP ? ' ' : it.ch);
+  }
+  function nbspIn(text) { return (text.match(/\u00A0/g) || []).length; }
+  // mask[g] = true -> gap g of this segment must not break. gl = meaningGlue(box source); wi = source word index of the
+  // segment's first word (an author NBSP inside a structure word counts as a source space).
+  function glueMask(seg, gl, wi) {
+    var mask = [];
+    wi += nbspIn(seg.words[0].text);
+    var js = KL.glue(seg.words.map(function (w) { return w.text.replace(/\u00A0/g, ' '); }).join(' ')), pos = seg.words[0].text.length;
+    for (var g = 0; g < seg.gaps.length; g++) {
+      var a = seg.words[g].text, b = seg.words[g + 1].text;
+      mask.push(!seg.gaps[g].wrap || gl[wi] || js[pos] === NBSP || OPEN_GLUE.test(a) || CLOSE_GLUE.test(b) || /^\uFFFC+$/.test(a));
+      wi += 1 + nbspIn(b);
+      pos += 1 + b.length;
+    }
+    return { mask: mask, next: wi + 1 };
+  }
+  /** Break after gap indexes; same line count as plain wrapping, even lines, last line >= 3 syllables. */
+  function chooseBreaks(seg, mask, W) {
+    // Tokens = words joined across glued gaps.
+    var toks = [];
+    for (var i = 0; i < seg.words.length; i++) {
+      var w = seg.words[i], ww = 0;
+      w.items.forEach(function (it) { ww += itemWidth(it); });
+      w.width = ww * 1.02;
+      // A glued run wider than the box cannot stay whole: release the glue at the gap that would overflow.
+      if (i > 0 && mask[i - 1] && toks[toks.length - 1].w + gapWidth(seg.gaps[i - 1]) + ww <= W - 2) {
+        var c = toks[toks.length - 1];
+        c.w += gapWidth(seg.gaps[i - 1]) + ww; c.text += ' ' + w.text; c.lastWord = i;
+      } else toks.push({ w: ww, text: w.text, lastWord: i });
+    }
+    var n = toks.length;
+    if (n < 2) return [];
+    var gw = [];
+    for (var t = 0; t < n - 1; t++) gw.push(gapWidth(seg.gaps[toks[t].lastWord]));
+    var pre = [0], gp = [0];
+    for (t = 0; t < n; t++) pre.push(pre[t] + toks[t].w * 1.02);
+    for (t = 0; t < n - 1; t++) gp.push(gp[t] + gw[t]);
+    var syl = [0];
+    for (t = 0; t < n; t++) syl.push(syl[t] + KL.syllables(toks[t].text));
+    function span(a, b) { return pre[b + 1] - pre[a] + gp[b] - gp[a]; }
+    var Wd = W - 2;
+    var greedy = 0, k = 0;
+    while (k < n) { var e = k; while (e + 1 < n && span(k, e + 1) <= Wd) e++; greedy++; k = e + 1; }
+    if (greedy < 2) return [];
+    // 1.1.1: solved twice, with and without the comma/separator preference; a layout the gate would call ragged or
+    // orphaned never wins because of that preference (studio "... (기록 대조 + 멈춘 그림) - / 028d 정정 반영" = 2.59).
+    var INF = 1e18, maxL = Math.min(n, greedy + 1);
+    function solve(bonus) {
+      var best = [], prev = [];
+      for (var a = 0; a <= n; a++) { best[a] = []; prev[a] = []; for (var L = 0; L <= maxL; L++) best[a][L] = INF; }
+      best[0][0] = 0;
+      for (var L2 = 1; L2 <= maxL; L2++) {
+        for (var j = 1; j <= n; j++) {
+          for (var i2 = 0; i2 < j; i2++) {
+            if (best[i2][L2 - 1] >= INF) continue;
+            var wv = span(i2, j - 1);
+            var over = wv > Wd ? (j - i2 === 1 ? 1e9 : INF) : 0;
+            if (over >= INF) continue;
+            var slack = Math.max(0, Wd - wv), cost = slack * slack + over, s = syl[j] - syl[i2];
+            if (s < 3) cost += 1e7;
+            if (j === n && s < 3) cost += 1e8;
+            if (bonus && j < n && /(,| [\u00B7|\/\-\u2013\u2014])$/.test(toks[j - 1].text)) cost -= Wd * Wd * 0.08;
+            var tot = best[i2][L2 - 1] + cost;
+            if (tot < best[j][L2]) { best[j][L2] = tot; prev[j][L2] = i2; }
+          }
+        }
+      }
+      return { best: best, prev: prev };
+    }
+    function lines(sol, LL) {
+      var starts = [], end = n;
+      while (LL > 0) { var st = sol.prev[end][LL]; starts.unshift(st); end = st; LL--; }
+      return starts;
+    }
+    // Same rules as the gate: last line >= 3 syllables, widest/narrowest <= 2.5 (2.3 here: estimated widths are not
+    // painted widths), nothing wider than the box.
+    function badness(starts) {
+      var ws = [], bad = 0;
+      starts.forEach(function (st, k) {
+        var en = k + 1 < starts.length ? starts[k + 1] - 1 : n - 1;
+        var wv = span(st, en);
+        ws.push(wv);
+        if (wv > Wd) bad += 100;
+      });
+      if (syl[n] - syl[starts[starts.length - 1]] < 3) bad += 1;
+      if (Math.max.apply(null, ws) / Math.max(1, Math.min.apply(null, ws)) > 2.3) bad += 1;
+      return bad;
+    }
+    var pick = null, pickBad = INF;
+    [solve(true), solve(false)].forEach(function (sol) {
+      [greedy, greedy + 1].forEach(function (L) {
+        if (L > maxL || sol.best[n][L] >= INF) return;
+        var st = lines(sol, L), b = badness(st);
+        if (b < pickBad) { pick = st; pickBad = b; }
+      });
+    });
+    if (pick == null) return [];
+    return pick.slice(1).map(function (st) { return toks[st - 1].lastWord; });
+  }
+  function gapWidth(gap) {
+    if (!gap || !gap.chars.length) return 0;
+    var c = gap.chars[0];
+    return widthFn(c.fontEl)(' ') * (c.preserve ? gap.chars.length : 1);
+  }
+
+  // ---------- applying and undoing ----------
+  function restore(box) {
+    var rec = records.get(box);
+    if (!rec) return;
+    records.delete(box);
+    rec.edits.forEach(function (e) { if (e.node.data === e.wrote) e.node.data = e.orig; });
+    box.style.wordBreak = rec.wordBreak;
+    // Reading the attribute first makes Chromium sync its lazily serialized inline style; otherwise a later sync
+    // brings back style="" after removeAttribute.
+    if (rec.styleAttr == null && box.getAttribute('style') === '') box.removeAttribute('style');
+    if (ro) ro.unobserve(box);
+  }
+  function edit(box, segs, keepGaps, maxWord) {
+    // All gaps except the chosen breaks become NBSP (a collapsible run becomes ONE NBSP). Gaps in nowrap text stay.
+    var perNode = new Map();
+    function plan(it, to, extra, before) {
+      var p = perNode.get(it.node);
+      if (!p) { p = {}; perNode.set(it.node, p); }
+      p[it.i] = { s: extra ? (before ? extra + to : to + extra) : to, len: it.len };
+    }
+    function planned(it) { var p = perNode.get(it.node); return p && p[it.i] ? p[it.i].s : it.ch; }
+    // 1.1.0: a word joiner (U+2060, invisible) at EVERY join inside a word, and the box gets word-break: normal.
+    // WebKit (Safari) ignores U+2060 under word-break: keep-all and breaks at '·' and '(' ("식사·|수업",
+    // "여기캠프(|주식회사"); under normal both engines keep a joined word whole. A word wider than the box only gets
+    // joiners between letters, so it can still break at its punctuation instead of overflowing.
+    function join(a, b, lettersOnly) {
+      if (lettersOnly && !(a.t === 'c' && b.t === 'c' && LETTER.test(a.ch) && LETTER.test(b.ch))) return;
+      if (a.t === 'c' && a.wrap) plan(a, planned(a), WJ);
+      else if (b.t === 'c' && b.wrap) plan(b, planned(b), WJ, true);
+    }
+    segs.forEach(function (seg, si) {
+      seg.words.forEach(function (w) {
+        for (var k = 1; k < w.items.length; k++) join(w.items[k - 1], w.items[k], w.width > maxWord);
+      });
+      seg.gaps.forEach(function (gap, g) {
+        if (!gap.wrap || keepGaps[si].has(g)) return;
+        // UAX 14 LB12a: a break IS allowed between '-', '–', '|' (HY/BA) and U+00A0; a word joiner first closes it
+        // ("… 그림) - | 028d" in the 1.1.0 studio report).
+        var prevItems = seg.words[g].items, last = prevItems[prevItems.length - 1];
+        var guard = last && last.t === 'c' && !WORDCH.test(last.ch) ? WJ : '';
+        gap.chars.forEach(function (c, ci) {
+          if (c.preserve) plan(c, (ci === 0 ? guard : '') + NBSP);
+          else plan(c, ci === 0 ? guard + NBSP : '');
+        });
+      });
+    });
+    var edits = [];
+    perNode.forEach(function (p, node) {
+      var orig = node.data, out = '';
+      for (var i = 0; i < orig.length; i++) {
+        if (p[i]) { out += p[i].s; i += p[i].len - 1; } else out += orig[i];
+      }
+      if (out !== orig) { node.data = out; edits.push({ node: node, orig: orig, wrote: out }); }
+    });
+    return edits;
+  }
+  function process(box) {
+    if (banned.has(box) || !box.isConnected) return;
+    var kind = kindOf(box);
+    if (!kind || !box.getClientRects().length || inClosedDetails(box)) return;
+    var items = model(box);
+    var segs = structure(items);
+    var src = sourceOf(segs);
+    if (!HANGUL.test(src)) return;
+    var W = contentWidth(box);
+    var key = src + '|' + W;
+    if (clean.get(box) === key) return;
+    var before = score(problemsOf(box, kind, items).problems);
+    if (!before || kind !== 'box' || W <= 0) { if (!before) clean.set(box, key); return; }
+    var gl = meaningGlue(src), wi = 0, keep = [];
+    segs.forEach(function (seg) {
+      var gm = glueMask(seg, gl, wi);
+      wi = gm.next;
+      keep.push(new Set(chooseBreaks(seg, gm.mask, W)));
+    });
+    var width0 = box.getBoundingClientRect().width;
+    var rec = { edits: [], wordBreak: box.style.wordBreak, styleAttr: box.getAttribute('style'), width: W };
+    box.style.wordBreak = FIX_WORD_BREAK;
+    rec.edits = edit(box, segs, keep, W - 2);
+    records.set(box, rec);
+    csCache = new Map();
+    var after = score(problemsOf(box, kind).problems);
+    if (after >= before || (Math.abs(box.getBoundingClientRect().width - width0) > 0.5 && !flexRoom(box))) { restore(box); return; }
+    if (ro) ro.observe(box);
+  }
+
+  // A flex/grid item may grow (e.g. a name squeezed by a long email) if its row still fits.
+  function flexRoom(box) {
+    var p = box.parentElement;
+    if (!p || !/^(inline-)?(flex|grid)$/.test(cs(p).display)) return false;
+    return p.scrollWidth <= p.clientWidth + 1;
+  }
+  function score(problems) {
+    var s = 0;
+    problems.forEach(function (p) { s += p.type === 'overflow' ? 100 : 1; });
+    return s;
+  }
+
+  // ---------- scheduling ----------
+  var pending = new Set(), full = false, timer = null, busy = false, waiters = [], mo = null, ro = null;
+  function schedule(node) {
+    if (node) pending.add(node); else full = true;
+    if (!timer) timer = setTimeout(flush, 120);
+  }
+  function boxesUnder(rootNode, set) {
+    var start = rootNode.nodeType === 3 ? rootNode.parentNode : rootNode;
+    if (!start || !start.isConnected) return;
+    if (rootNode.nodeType === 3) { var b0 = boxOf(rootNode); if (b0) set.add(b0); }
+    var w = document.createTreeWalker(start, NodeFilter.SHOW_TEXT), t;
+    while ((t = w.nextNode())) {
+      if (!HANGUL.test(t.data)) continue;
+      var b = boxOf(t);
+      if (b) set.add(b);
+    }
+    // A change inside a box (or a box's ancestor) re-checks that box.
+    var up = start;
+    while (up && up.nodeType === 1) { if (records.has(up)) set.add(up); up = up.parentElement; }
+  }
+  function flush() {
+    timer = null;
+    if (!document.body) { schedule(); return; }
+    busy = true;
+    csCache = new Map();
+    try {
+      var roots = full ? [document.body] : Array.from(pending);
+      pending.clear(); full = false;
+      var boxes = new Set();
+      roots.forEach(function (r) { boxesUnder(r, boxes); });
+      records.forEach(function (rec, box) {
+        if (!box.isConnected) { records.delete(box); return; }
+        if (contentWidth(box) !== rec.width) boxes.add(box);
+      });
+      var now = Date.now();
+      // Undo first (all), then measure and apply: an undo can change the size of a neighbour.
+      boxes.forEach(function (box) {
+        var c = (churn.get(box) || []).filter(function (t) { return now - t < 10000; });
+        if (records.has(box)) { c.push(now); churn.set(box, c); }
+        if (c.length > 20) { restore(box); banned.add(box); return; }
+        restore(box);
+      });
+      csCache = new Map();
+      boxes.forEach(function (box) { process(box); csCache = csCache || new Map(); });
+    } catch (e) {
+      if (root.console) console.warn('ko-linebreak:', e);
+    } finally {
+      csCache = null;
+      if (mo) mo.takeRecords();
+      busy = false;
+      if (!timer) { var ws = waiters; waiters = []; ws.forEach(function (f) { f(); }); }
+    }
+  }
+  function onMutations(list) {
+    if (busy) return;
+    list.forEach(function (m) {
+      if (m.type === 'attributes' && m.attributeName === 'style' && records.has(m.target)
+        && m.target.style.wordBreak === FIX_WORD_BREAK) return; // our own write
+      schedule(m.target);
+      if (m.type === 'childList') m.addedNodes.forEach(function (n) { schedule(n); });
+    });
+  }
+  function start() {
+    mo = new MutationObserver(onMutations);
+    mo.observe(document.documentElement, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'open'] });
+    if (root.ResizeObserver) ro = new ResizeObserver(function (entries) {
+      entries.forEach(function (en) { var rec = records.get(en.target); if (rec && contentWidth(en.target) !== rec.width) schedule(en.target); });
+    });
+    root.addEventListener('resize', function () { schedule(); });
+    root.addEventListener('load', function () { schedule(); });
+    if (document.fonts) {
+      document.fonts.ready.then(function () { schedule(); });
+      if (document.fonts.addEventListener) document.fonts.addEventListener('loadingdone', function () { schedule(); });
+    }
+    schedule();
+  }
+
+  /** Measured problems of every visible Korean box under rootEl (default body). Used by check.mjs. */
+  function check(rootEl) {
+    csCache = new Map();
+    try {
+      var set = new Set();
+      boxesUnder(rootEl || document.body, set);
+      var out = [];
+      set.forEach(function (box) {
+        var kind = kindOf(box);
+        if (!kind || !box.getClientRects().length || inClosedDetails(box)) return;
+        var st = cs(box);
+        if (st.visibility === 'hidden') return;
+        var items = model(box), src = sourceOf(structure(items));
+        if (!HANGUL.test(src)) return;
+        var r = problemsOf(box, kind, items);
+        out.push({ box: describe(box), kind: kind, text: src.slice(0, 80), src: src, breaks: breaksOf(items), lines: r.lines, problems: r.problems });
+      });
+      return out;
+    } finally { csCache = null; }
+  }
+  // Source word index of every line start that is a wrap or a <br> (the gate checks these against Kiwi's glue).
+  function breaksOf(items) {
+    var out = [];
+    linesOf(units(items)).forEach(function (lines, si) {
+      lines.forEach(function (l, i) {
+        if ((i && l.first.gapBefore) || (!i && si && l.first.forcedBefore === 'br')) out.push(l.first.wi);
+      });
+    });
+    return out;
+  }
+  // Text the drop-in (or anything) broke: a lone surrogate half, or U+2060 / U+00A0 inside a grapheme cluster
+  // (before a combining mark, variation selector, skin tone or tag, after a ZWJ, or between two flag letters).
+  var LONE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  var INSIDE = /[\u2060\u00A0](?=\p{M}|\u200D|[\uFE0E\uFE0F]|[\u{1F3FB}-\u{1F3FF}]|[\u{E0020}-\u{E007F}])|\u200D[\u2060\u00A0]|[\u{1F1E6}-\u{1F1FF}][\u2060\u00A0][\u{1F1E6}-\u{1F1FF}]/u;
+  function brokenText(rootEl) {
+    var out = [], w = document.createTreeWalker(rootEl || document.body, NodeFilter.SHOW_TEXT), t;
+    while ((t = w.nextNode())) {
+      var d = t.data, m = LONE.exec(d) || INSIDE.exec(d), bad = m ? (LONE.test(d) ? 'lone-surrogate' : 'joiner-inside-grapheme') : null;
+      if (!bad && /[\u2060\u00A0]/.test(d)) {
+        clusters(d).forEach(function (c) { if (!bad && c.s.length > 1 && /[\u2060\u00A0]/.test(c.s)) { bad = 'joiner-inside-grapheme'; m = { index: c.i }; } });
+      }
+      if (!bad) continue;
+      var at = d.slice(Math.max(0, m.index - 12), m.index + 14).replace(/[\uD800-\uDFFF\u2060\u00A0\u200D\uFE0F]/g, function (c) { return '\\u' + c.charCodeAt(0).toString(16).toUpperCase(); });
+      out.push({ type: bad, box: t.parentElement ? describe(t.parentElement) : '#text', at: at });
+    }
+    return out;
+  }
+  function describe(el) {
+    var s = el.tagName.toLowerCase();
+    if (el.id) s += '#' + el.id;
+    var cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).slice(0, 2).join('.') : '';
+    if (cls) s += '.' + cls;
+    return s;
+  }
+
+  var api = {
+    version: VERSION,
+    check: check,
+    brokenText: brokenText,
+    meaningGlue: meaningGlue,
+    clusters: clusters,
+    scan: function (node) { schedule(node); },
+    idle: function () { return new Promise(function (res) { if (!timer && !busy) res(); else waiters.push(res); }); },
+    restoreAll: function () { Array.from(records.keys()).forEach(restore); },
+    applied: function () { return records.size; }
+  };
+  root.KoLinebreakAuto = api;
+  if (root.KO_LINEBREAK_NO_AUTO) return;
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script></head>
 <body>
 <main>
   <p class="small">아버지께 · 리치가 드리는 안내</p>
-  <h1>스레드 자동 글쓰기<br>연결 방법</h1>
+  <h1>스레드 자동 글쓰기 연결 방법</h1>
   <p class="lead">딱 두 가지만 하시면 돼요. 5분이면 끝나요.<br><b>꼭 사파리(또는 크롬)로 여세요. 카카오톡 안에서 열면 연결이 안 돼요.</b><br>어려우시면 이 화면을 리치에게 보여주세요.</p>
 
   <section class="card">
     <h2><span class="num">1</span>초대 수락하기</h2>
-    <p>리치가 아버지 스레드 계정(@sangun.dbclass)으로 초대를 보냈어요. <b>폰 인터넷</b>(사파리·크롬)에서 수락하시면 돼요. 스레드 앱에는 이 메뉴가 안 보일 수 있어요.</p>
+    <p>리치가 아버지 스레드 계정(@sangun.dbclass)으로 초대를 보냈어요. <b>폰&nbsp;인터넷</b>(사파리·크롬)에서 수락하시면 돼요. 스레드 앱에는 이 메뉴가 안 보일 수 있어요.</p>
     <ol class="path">
       <li>이 주소를 누르세요: <a href="https://www.threads.com/settings/account">threads.com/settings/account</a></li>
       <li>스레드에 로그인하세요 (평소 쓰시는 @sangun.dbclass).</li>
-      <li><span class="tap">웹사이트 권한</span>을 누르세요.</li>
-      <li><span class="tap">초대</span>에서 <b>아버지의 스레드</b> 옆 <span class="tap">수락</span>을 누르세요.</li>
+      <li><span class="keep"><span class="tap">웹사이트 권한</span>을</span> 누르세요.</li>
+      <li><span class="tap">초대</span>에서 <b>아버지의 스레드</b> 옆 <span class="keep"><span class="tap">수락</span>을</span> 누르세요.</li>
     </ol>
     <div class="note">메뉴가 영어로 보이면: Website permissions → Invites → Accept<br>수락하면 "초대 수락됨"이라고 떠요. 그걸로 1번은 끝이에요.</div>
   </section>
@@ -44,10 +957,10 @@
     <h2><span class="num">2</span>앱에서 연결 누르기</h2>
     <ol class="path">
       <li>이 주소를 누르세요: <a href="https://kabob-singer-deception.ngrok-free.dev">아버지의 스레드 열기</a> (즐겨찾기에 넣어 두세요)</li>
-      <li>처음 한 번 "ngrok" 안내 화면이 나오면 <span class="tap">Visit Site</span>를 누르세요.</li>
+      <li>처음 한 번 "ngrok" 안내 화면이 나오면 <span class="keep"><span class="tap">Visit Site</span>를</span> 누르세요.</li>
       <li>구글 로그인 화면이 나오면 <b>fcamember@gmail.com</b>으로 로그인하세요.</li>
-      <li>앱 위쪽 <span class="tap">스레드 연결하기</span>를 누르세요.</li>
-      <li>스레드 화면에서 <span class="tap">sangun.dbclass(으)로 계속</span>을 누르세요.</li>
+      <li>앱 위쪽 버튼을 누르세요.<span class="tap own">스레드 연결하기</span></li>
+      <li>스레드에서 이 버튼을 누르세요.<span class="tap own">sangun.dbclass(으)로 계속</span></li>
     </ol>
     <div class="note">이 연결은 아버지 계정에만 쓰여요. 앱은 아버지가 <b>올리기</b>를 누르실 때만 글을 올려요. 마음대로 올리지 않아요.</div>
   </section>
