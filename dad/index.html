@@ -24,7 +24,7 @@
   .tap.own { display:table; margin-top:6px; white-space:normal; }
 </style>
 <script>window.KO_LINEBREAK_PHRASES = ["구글 로그인", "글쓰기 연결", "꼭 사파리(또는", "누르실 때만", "두 가지만", "드리는 안내", "딱 두", "로그인 화면이", "리치가 드리는", "만들고 바로", "보일 수", "스레드 앱에는", "스레드 열기", "스레드 자동", "쓰시는 @sangun.dbclass).", "아버지 계정에만", "아버지 스레드", "안 돼요.", "안 보일", "안내 화면이", "앱 위에", "앱 위쪽", "연결 방법", "올리실 수", "웹사이트 권한", "위쪽 버튼을", "카카오톡 안에서", "폰 인터넷", "한 번"];</script><script>
-/*! ko-linebreak dropin 1.1.2 | ~/projects/richard/shared/ko-linebreak | one line: <script src="ko-linebreak-dropin-1.1.2.js" defer><\/script> */
+/*! ko-linebreak dropin 1.1.3 | ~/projects/richard/shared/ko-linebreak | one line: <script src="ko-linebreak-dropin-1.1.3.js" defer><\/script> */
 /*
  * ko-linebreak.js - Korean line breaking for card news / ad HTML rendered in Chromium.
  * No dependencies. Load as a plain <script> (sets globalThis.KoLinebreak) or require() it.
@@ -251,7 +251,7 @@
   'use strict';
   var KL = root.KoLinebreak;
   if (!KL || typeof document === 'undefined' || root.KoLinebreakAuto) return;
-  var VERSION = "1.1.2";
+  var VERSION = "1.1.3";
   var NBSP = '\u00A0';
   var HANGUL = /[\uAC00-\uD7A3]/;
   var LETTER = /[\uAC00-\uD7A3A-Za-z]/;
@@ -812,6 +812,7 @@
     busy = true;
     csCache = new Map();
     try {
+      wrapNumbers(document.body);
       var roots = full ? [document.body] : Array.from(pending);
       pending.clear(); full = false;
       var boxes = new Set();
@@ -918,8 +919,38 @@
     return s;
   }
 
+  // 1.1.3: WebKit (Safari) breaks inside numbers under word-break: keep-all ("약 9." / "5%"; U+2060 does not stop it there),
+  // so every number run is wrapped in a nowrap span. The text stays byte-identical and a run is wrapped once.
+  var NUM = /\d+(?:[.,:\/]\d+)+(?:%|[A-Za-z]+|[\uAC00-\uD7A3](?![\uAC00-\uD7A3]))?|\d+%/g;
+  function wrapNumbers(rootEl) {
+    var w = document.createTreeWalker(rootEl || document.body, NodeFilter.SHOW_TEXT), t, todo = [];
+    while ((t = w.nextNode())) {
+      var p = t.parentElement;
+      if (!p || p.closest(SKIP) || p.closest('span.ko-num')) continue;
+      NUM.lastIndex = 0;
+      if (NUM.test(t.data)) todo.push(t);
+    }
+    todo.forEach(function (node) {
+      var d = node.data, m, last = 0, frag = document.createDocumentFragment();
+      NUM.lastIndex = 0;
+      while ((m = NUM.exec(d))) {
+        if (m.index > last) frag.appendChild(document.createTextNode(d.slice(last, m.index)));
+        var s = document.createElement('span');
+        s.className = 'ko-num';
+        s.style.whiteSpace = 'nowrap';
+        s.textContent = m[0];
+        frag.appendChild(s);
+        last = m.index + m[0].length;
+      }
+      if (last < d.length) frag.appendChild(document.createTextNode(d.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    });
+    return todo.length;
+  }
+
   var api = {
     version: VERSION,
+    wrapNumbers: wrapNumbers,
     check: check,
     brokenText: brokenText,
     meaningGlue: meaningGlue,
