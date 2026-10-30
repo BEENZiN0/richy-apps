@@ -24,7 +24,7 @@
   .tap.own { display:table; margin-top:6px; white-space:normal; }
 </style>
 <script>window.KO_LINEBREAK_PHRASES = ["구글 로그인", "글쓰기 연결", "꼭 사파리(또는", "누르실 때만", "두 가지만", "드리는 안내", "딱 두", "로그인 화면이", "리치가 드리는", "만들고 바로", "보일 수", "스레드 앱에는", "스레드 열기", "스레드 자동", "쓰시는 @sangun.dbclass).", "아버지 계정에만", "아버지 스레드", "안 돼요.", "안 보일", "안내 화면이", "앱 위에", "앱 위쪽", "연결 방법", "올리실 수", "웹사이트 권한", "위쪽 버튼을", "카카오톡 안에서", "폰 인터넷", "한 번"];</script><script>
-/*! ko-linebreak dropin 1.1.4 | ~/projects/richard/shared/ko-linebreak | one line: <script src="ko-linebreak-dropin-1.1.4.js" defer><\/script> */
+/*! ko-linebreak dropin 1.1.5 | ~/projects/richard/shared/ko-linebreak | one line: <script src="ko-linebreak-dropin-1.1.5.js" defer><\/script> */
 /*
  * ko-linebreak.js - Korean line breaking for card news / ad HTML rendered in Chromium.
  * No dependencies. Load as a plain <script> (sets globalThis.KoLinebreak) or require() it.
@@ -251,7 +251,7 @@
   'use strict';
   var KL = root.KoLinebreak;
   if (!KL || typeof document === 'undefined' || root.KoLinebreakAuto) return;
-  var VERSION = "1.1.4";
+  var VERSION = "1.1.5";
   var NBSP = '\u00A0';
   var HANGUL = /[\uAC00-\uD7A3]/;
   var LETTER = /[\uAC00-\uD7A3A-Za-z]/;
@@ -488,6 +488,8 @@
       if (m && RANGE[m[1]] && new RegExp('^[0-9][0-9,.]*' + RANGE[m[1]] + '(?![0-9])').test(b)) out[g] = true;
       if (/[0-9][만천억]$/.test(a) && UNIT.test(b)) out[g] = true;
       if (auxGlued(a, b.replace(/[,.!?)\]]+$/, ''))) out[g] = true;
+      // 1.1.5 (127f-2): '-ㄹ 수/것/줄 있·없…' keeps all three words on one line (both gaps), as the gate's aux-split checks.
+      if (g + 2 < n && boundGlued(a, b, words[g + 2])) { out[g] = true; out[g + 1] = true; }
       if (g > 0 && SEPARATOR.test(words[g - 1]) && KL.syllables(a) <= 3 && !/[,.!?]$/.test(a) && /[\uAC00-\uD7A3]/.test(b)) out[g] = true;
     }
     phraseList().forEach(function (p) {
@@ -962,8 +964,23 @@
   // as the check.mjs aux-split rule. It is a meaning glue (NBSP while the box is fixed, restored by restoreAll), not a
   // new element: wrapping in a span would split text nodes that frameworks update in place.
   var AUX_A = /^[\uAC00-\uD7A3]+(?:어|아|여|고|해|줘|봐|써|와|워|둬|놔|져|려|쳐|켜)$/u, AUX_B = /^(?:주(?:세요|시|신|실|고|면|는|어|었|셔)|줘|준|줄|있|없|보(?:세요|시|고|면|는|았|아)|봐|봤|볼|두(?:세요|시|고|면|는|었|어)|둬|둔|둘|놓|놔|버리|버려|버렸|버린|싶)/u;
-  function auxGlued(a, b) { return AUX_A.test(a) && AUX_B.test(b); }
-  function wrapAux(src) { var w = String(src).split(/\s+/), out = []; for (var i = 0; i + 1 < w.length; i++) if (auxGlued(w[i], w[i + 1])) out.push(w[i] + ' ' + w[i + 1]); return out; }
+  // 1.1.5 (127f-2): also '-지 않…' ("동의하지 않으시면") and '-아야/-어야 하·해…' ("바꿔야 해요"), the patterns the gate's aux-split
+  // rule checks since 127f. The 하/해 word must be the verb itself (해요 해야 해서 해 했… 합니… 하고 하면 한다), so "분야 해외" stays free.
+  var YA_B = /^(?:해요|해야|해서|해|했[\uAC00-\uD7A3]*|합니[\uAC00-\uD7A3]*|하고|하면|한다)(?![\uAC00-\uD7A3])/u;
+  function auxGlued(a, b) {
+    return (AUX_A.test(a) && AUX_B.test(b)) || (/[\uAC00-\uD7A3]지$/u.test(a) && /^않/u.test(b)) || (/[\uAC00-\uD7A3]야$/u.test(a) && YA_B.test(b));
+  }
+  // '-ㄹ 수/것/줄 있·없': the word before 수/것/줄 ends in a syllable with final ㄹ ((code - 0xAC00) % 28 === 8), so "숫자 수 있어요" stays free.
+  function rieulFinal(w) { var c = w.charCodeAt(w.length - 1) - 0xAC00; return c >= 0 && c < 11172 && c % 28 === 8; }
+  function boundGlued(a, b, c) { return /[\uAC00-\uD7A3]$/u.test(a) && rieulFinal(a) && /^(?:수|것|줄)$/u.test(b) && /^(?:있|없)/u.test(c); }
+  function wrapAux(src) {
+    var w = String(src).split(/\s+/), out = [];
+    for (var i = 0; i + 1 < w.length; i++) {
+      if (auxGlued(w[i], w[i + 1])) out.push(w[i] + ' ' + w[i + 1]);
+      else if (i + 2 < w.length && boundGlued(w[i], w[i + 1], w[i + 2])) out.push(w[i] + ' ' + w[i + 1] + ' ' + w[i + 2]);
+    }
+    return out;
+  }
 
   var api = {
     version: VERSION,
